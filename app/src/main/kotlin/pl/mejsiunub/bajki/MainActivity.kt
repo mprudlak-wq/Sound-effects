@@ -112,6 +112,39 @@ class MainActivity : Activity() {
         ).apply { topMargin = dp(16) }
     }
 
+    private class Collapsible(val card: LinearLayout, val body: LinearLayout, val setOpen: (Boolean) -> Unit)
+
+    // Karta z nagłówkiem, który zwija i rozwija zawartość (▾ otwarta, ▸ zwinięta).
+    private fun collapsible(title: String, open: Boolean, onToggle: (Boolean) -> Unit = {}): Collapsible {
+        val card = card()
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        val header = label("", 14f, "#FFFFFF", true).apply { setPadding(0, dp(4), 0, dp(4)) }
+        fun setOpen(o: Boolean) {
+            body.visibility = if (o) View.VISIBLE else View.GONE
+            header.text = (if (o) "▾  " else "▸  ") + title
+        }
+        setOpen(open)
+        header.setOnClickListener {
+            val o = body.visibility != View.VISIBLE
+            setOpen(o)
+            onToggle(o)
+        }
+        card.addView(header)
+        card.addView(body)
+        return Collapsible(card, body, ::setOpen)
+    }
+
+    private fun commandItem(cmd: String, desc: String): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+            addView(label(cmd, 15f, gold, true))
+            addView(label(desc, 13f, "#FFFFFF").apply { setPadding(0, dp(2), 0, 0) })
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -185,28 +218,39 @@ class MainActivity : Activity() {
         historyCard.addView(historyText)
         content.addView(historyCard)
 
-        // Podpowiedź
-        val hintCard = card()
-        hintCard.addView(label("JAK TO DZIAŁA", 11f, "#C9B8F0", true))
-        hintCard.addView(label(
-            "Powiedz „dźwięk” i dowolne słowo, np. „dźwięk burzy”, „dźwięk smoka”, „dźwięk samochód”. " +
-                "Możesz podać do dwóch słów, np. „dźwięk latający komar”. Nie podoba ci się dźwięk? Powiedz „dźwięk inny” (inny wariant) albo „dźwięk stop” (cisza). " +
-                "Mów wyraźnie, z krótką pauzą przed i po komendzie. Zwykły tekst bajki jest ignorowany.",
-            14f, "#FFFFFF"
-        ).apply { setPadding(0, dp(4), 0, 0) })
-        content.addView(hintCard)
+        // Jak to działa (zwijane, zapamiętuje stan)
+        val help = collapsible("Jak to działa", prefs.getBoolean("help_open", true)) {
+            prefs.edit().putBoolean("help_open", it).apply()
+        }
+        help.body.addView(commandItem(
+            "„dźwięk burza”",
+            "Odtwarza dźwięk dla dowolnego słowa. Możesz podać do dwóch słów, np. „dźwięk latający komar”."
+        ))
+        help.body.addView(commandItem(
+            "„dźwięk inny”",
+            "Inny wariant ostatniego dźwięku (też: następny, kolejny, dalej). Wybrany wariant zostaje zapamiętany."
+        ))
+        help.body.addView(commandItem(
+            "„dźwięk stop”",
+            "Ucisza odtwarzany dźwięk (też: cisza, przestań, koniec)."
+        ))
+        help.body.addView(label(
+            "Wskazówki",
+            11f, "#C9B8F0", true
+        ).apply { setPadding(0, dp(10), 0, dp(2)) })
+        help.body.addView(label(
+            "• Po komendzie zrób krótką pauzę (ok. pół sekundy), żeby aplikacja wiedziała, gdzie się kończy.\n" +
+                "• Zwykły tekst bajki jest ignorowany, reaguje tylko na słowo „dźwięk”.\n" +
+                "• Dźwięki trwają do 10 s i zapisują się w telefonie, więc kolejny raz grają od razu.\n" +
+                "• Menu (trzy kreski w prawym górnym rogu): lista zapisanych dźwięków, odsłuch i usuwanie.",
+            13f, "#FFFFFF"
+        ))
+        content.addView(help.card)
 
         // Klucz API (zwijany)
-        val keyCard = card()
-        val keyBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val hasKey = !prefs.getString("key", "").isNullOrBlank()
-        keyBox.visibility = if (hasKey) View.GONE else View.VISIBLE
-        val keyHeader = label("⚙️  Klucz API Freesound", 14f, "#FFFFFF", true).apply {
-            setOnClickListener {
-                keyBox.visibility = if (keyBox.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-            }
-        }
-        keyCard.addView(keyHeader)
+        val keyCol = collapsible("Klucz API Freesound", !hasKey)
+        val keyBox = keyCol.body
 
         keyField = EditText(this).apply {
             hint = "Wklej klucz API"
@@ -216,9 +260,6 @@ class MainActivity : Activity() {
             setHintTextColor(Color.parseColor("#99FFFFFF"))
             background = rounded("#33FFFFFF", 12)
             setPadding(dp(14), dp(10), dp(14), dp(10))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(10) }
         }
         keyBox.addView(keyField)
 
@@ -234,11 +275,10 @@ class MainActivity : Activity() {
             setOnClickListener {
                 prefs.edit().putString("key", keyField.text.toString().trim()).apply()
                 say("Klucz zapisany.")
-                keyBox.visibility = View.GONE
+                keyCol.setOpen(false)
             }
         })
-        keyCard.addView(keyBox)
-        content.addView(keyCard)
+        content.addView(keyCol.card)
 
         val scroll = ScrollView(this).apply {
             isFillViewport = true
