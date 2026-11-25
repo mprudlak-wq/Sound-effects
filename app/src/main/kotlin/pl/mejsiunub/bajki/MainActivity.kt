@@ -175,24 +175,39 @@ class MainActivity : Activity() {
             .replace(Regex("\\p{M}+"), "")
 
     private fun handleText(text: String) {
-        val n = norm(text)
-        val idx = n.lastIndexOf(triggerWord)
+        val tokens = text.lowercase().split(" ").filter { it.isNotBlank() }
+        val idx = tokens.indexOfLast { norm(it).startsWith(triggerWord) }
         if (idx < 0) return                       // brak słowa-klucza -> ignorujemy
-        val words = n.substring(idx + triggerWord.length)
-            .trim().split(" ").filter { it.isNotBlank() }.take(2)
+        val words = tokens.drop(idx + 1).take(2)
         if (words.isEmpty()) return
-        val query = words.firstNotNullOfOrNull { w ->
-            dictionary.firstOrNull { w.startsWith(it.first) }?.second
-        } ?: words.joinToString(" ")
-        say("Komenda: \"${words.joinToString(" ")}\" -> szukam: $query")
-        fetchAndPlay(query)
+        say("Komenda: \"${words.joinToString(" ")}\" -> szukam...")
+        fetchAndPlay(words)
     }
 
-    private fun fetchAndPlay(query: String) {
+    // Słownik (szybko, offline), a dla innych słów darmowe tłumaczenie PL -> EN.
+    private fun translate(words: List<String>): String {
+        for (w in words) {
+            val n = norm(w)
+            dictionary.firstOrNull { n.startsWith(it.first) }?.let { return it.second }
+        }
+        val phrase = words.joinToString(" ")
+        try {
+            val url = "https://api.mymemory.translated.net/get?langpair=pl%7Cen&q=" +
+                URLEncoder.encode(phrase, "UTF-8")
+            val t = JSONObject(httpGet(url)).getJSONObject("responseData").getString("translatedText")
+            val clean = t.lowercase().replace(Regex("[^a-z ]"), " ").trim().replace(Regex(" +"), " ")
+            if (clean.isNotEmpty() && !t.uppercase().contains("MYMEMORY")) return clean
+        } catch (e: Exception) { /* przejdź do wyszukiwania po polsku */ }
+        return norm(phrase)
+    }
+
+    private fun fetchAndPlay(words: List<String>) {
         val key = prefs.getString("key", "").orEmpty().trim()
         if (key.isEmpty()) { say("Najpierw wpisz i zapisz klucz API."); return }
         thread {
             try {
+                val query = translate(words)
+                say("Szukam: $query")
                 val file = File(cacheDir, "snd_" + query.replace(Regex("[^a-z0-9]+"), "_") + ".mp3")
                 if (!file.exists()) {
                     val filter = URLEncoder.encode("duration:[1 TO 10]", "UTF-8")
@@ -202,7 +217,7 @@ class MainActivity : Activity() {
                         "&sort=rating_desc&fields=id,name,previews,duration&page_size=5" +
                         "&token=" + key
                     val results = JSONObject(httpGet(url)).getJSONArray("results")
-                    if (results.length() == 0) { say("Nie znaleziono dźwięku: $query"); return@thread }
+                    if (results.length() == 0) { say("Nie znaleziono dźwięku: ${words.joinToString(" ")} (szukano: $query)"); return@thread }
                     val mp3 = results.getJSONObject(0).getJSONObject("previews").getString("preview-hq-mp3")
                     download(mp3, file)
                 }
