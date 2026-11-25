@@ -47,7 +47,14 @@ import kotlin.concurrent.thread
 class MainActivity : Activity() {
 
     // Słowo-klucz: aplikacja reaguje tylko na frazy zaczynające się od tego słowa.
-    private val triggerWord = "dzwiek"
+    // Tryb językowy: "pl" (komendy „dźwięk ...”, tłumaczenie na angielski) albo
+    // "en" (komendy „sound ...”, szukanie dokładnie tego słowa bez tłumaczenia).
+    private var lang = "pl"
+    private val triggerWord get() = if (lang == "en") "sound" else "dzwiek"
+    private val stopWords get() =
+        if (lang == "en") listOf("stop", "silence", "quiet", "mute") else listOf("stop", "cisz", "przestan", "koniec")
+    private val nextWords get() =
+        if (lang == "en") listOf("next", "another", "other", "different") else listOf("inn", "nastepn", "kolejn", "dalej")
 
     // Polskie słowa (początki) -> angielskie hasła do wyszukiwania we Freesound.
     private val dictionary = listOf(
@@ -70,6 +77,7 @@ class MainActivity : Activity() {
     private var player: MediaPlayer? = null
     private lateinit var status: TextView
     private lateinit var heard: TextView
+    private lateinit var langBtn: TextView
     private lateinit var keyField: EditText
     private lateinit var micButton: FrameLayout
     private lateinit var micRing: GradientDrawable
@@ -149,6 +157,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        lang = prefs.getString("lang", "pl") ?: "pl"
         window.statusBarColor = Color.parseColor("#1B1B3A")
         cacheDir.listFiles()?.filter { it.name.startsWith("snd_") }?.forEach { it.delete() }
         window.navigationBarColor = Color.parseColor("#3B2667")
@@ -168,8 +177,18 @@ class MainActivity : Activity() {
             addView(IconView(context, IconView.MENU), FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
             setOnClickListener { showLibrary() }
         }
+        langBtn = label(lang.uppercase(), 14f, "#FFFFFF", true).apply {
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1AFFFFFF"))
+                cornerRadius = dp(22).toFloat()
+                setStroke(dp(2), Color.parseColor("#80FFFFFF"))
+            }
+            setOnClickListener { setLang(if (lang == "pl") "en" else "pl") }
+        }
         content.addView(LinearLayout(this).apply {
             gravity = Gravity.END
+            addView(langBtn, LinearLayout.LayoutParams(dp(56), dp(44)).apply { rightMargin = dp(10) })
             addView(menuBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
         })
 
@@ -236,6 +255,10 @@ class MainActivity : Activity() {
         help.body.addView(commandItem(
             "„dźwięk stop”",
             "Ucisza odtwarzany dźwięk (też: cisza, przestań, koniec)."
+        ))
+        help.body.addView(commandItem(
+            "Przycisk PL / EN (u góry)",
+            "Tryb EN: mówisz po angielsku „sound fireplace”, „sound next”, „sound stop”. Aplikacja szuka dokładnie tego słowa, bez tłumaczenia."
         ))
         help.body.addView(label(
             "Wskazówki",
@@ -422,11 +445,28 @@ class MainActivity : Activity() {
         historyText.text = history.joinToString("\n")
     }
 
+    private fun listenHint() =
+        if (lang == "en") "Słucham… powiedz „sound rain”" else "Słucham… powiedz „dźwięk burzy”"
+
+    private fun setLang(l: String) {
+        lang = l
+        prefs.edit().putString("lang", l).apply()
+        langBtn.text = l.uppercase()
+        say(if (l == "en") "Tryb angielski: powiedz np. „sound fireplace”" else "Tryb polski: powiedz np. „dźwięk burza”")
+        if (listening) {
+            micLabel.text = listenHint()
+            cancelPending()
+            firedIdx = -1
+            recognizer?.cancel()
+            restart(300)
+        }
+    }
+
     private fun setListeningUi(on: Boolean) {
         val c = Color.parseColor(if (on) teal else gold)
         micRing.setStroke(dp(3), c)
         micIcon.color = c
-        micLabel.text = if (on) "Słucham… powiedz „dźwięk burzy”" else "Dotknij, aby zacząć słuchać"
+        micLabel.text = if (on) listenHint() else "Dotknij, aby zacząć słuchać"
         pulse?.cancel()
         micButton.scaleX = 1f; micButton.scaleY = 1f
         if (on) {
@@ -477,7 +517,7 @@ class MainActivity : Activity() {
         if (!listening) return
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pl-PL")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (lang == "en") "en-US" else "pl-PL")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
@@ -575,7 +615,8 @@ class MainActivity : Activity() {
 
     // Słowo-klucz, także gdy telefon przekręci je o jedną literę (np. "dziwek", "dzwik").
     private fun isTrigger(n: String): Boolean =
-        n.startsWith(triggerWord) || (n.length in 5..8 && distance(n, triggerWord) <= 1)
+        if (lang == "en") n == "sound" || n == "sounds"      // po angielsku bez "zgadywania" (np. found, round)
+        else n.startsWith(triggerWord) || (n.length in 5..8 && distance(n, triggerWord) <= 1)
 
     // Rozpoznawanie podaje kilka wersji tego, co usłyszało. Bierzemy pierwszą ze słowem-kluczem.
     private fun pickText(list: List<String>?): String? =
@@ -604,11 +645,11 @@ class MainActivity : Activity() {
         lastCmd = norm(phrase)
         lastCmdTime = now
         when {
-            listOf("stop", "cisz", "przestan", "koniec").any { n.startsWith(it) } -> {
+            stopWords.any { n.startsWith(it) } -> {
                 stopSound()
                 say("Dźwięk zatrzymany.")
             }
-            listOf("inn", "nastepn", "kolejn", "dalej").any { n.startsWith(it) } -> {
+            nextWords.any { n.startsWith(it) } -> {
                 say("Szukam innego dźwięku...")
                 fetchAndPlay(words, true)
             }
@@ -626,6 +667,10 @@ class MainActivity : Activity() {
 
     // Słownik (szybko, offline), a dla innych słów darmowe tłumaczenie PL -> EN.
     private fun translate(words: List<String>): String {
+        if (lang == "en") {   // tryb EN: szukaj dokładnie tego, co powiedziałeś, bez tłumaczenia
+            val q = words.joinToString(" ").lowercase().replace(Regex("[^a-z0-9 ]"), " ").trim().replace(Regex(" +"), " ")
+            return if (q.isNotEmpty()) q else norm(words.joinToString(" "))
+        }
         for (w in words) {
             val n = norm(w)
             dictionary.firstOrNull { matchesStem(n, it.first) }?.let { return it.second }
