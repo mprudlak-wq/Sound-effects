@@ -57,7 +57,7 @@ class MainActivity : Activity() {
         "sow" to "owl", "ptak" to "birds", "ptas" to "birds", "ogien" to "fire crackling",
         "ogni" to "fire crackling", "morz" to "ocean waves", "fal" to "ocean waves",
         "las" to "forest ambience", "kot" to "cat meow", "pies" to "dog bark",
-        "smok" to "dragon roar", "kon" to "horse", "dzwon" to "bell",
+        "smok" to "dragon roar", "kon" to "horse", "dzwonek" to "bell", "dzwon" to "bell", "les" to "forest ambience",
         "smiech" to "laugh", "czar" to "magic spell", "magi" to "magic spell",
         "kruk" to "raven", "zaba" to "frog", "swierszcz" to "crickets",
         "strumien" to "stream water", "rzek" to "river", "krow" to "cow",
@@ -69,6 +69,7 @@ class MainActivity : Activity() {
     private var listening = false
     private var player: MediaPlayer? = null
     private lateinit var status: TextView
+    private lateinit var heard: TextView
     private lateinit var keyField: EditText
     private lateinit var micButton: FrameLayout
     private lateinit var micRing: GradientDrawable
@@ -207,6 +208,8 @@ class MainActivity : Activity() {
         statusCard.addView(label("STATUS", 11f, "#C9B8F0", true))
         status = label("Powiedz np.: „dźwięk burzy”", 16f, "#FFFFFF").apply { setPadding(0, dp(4), 0, 0) }
         statusCard.addView(status)
+        heard = label("", 12f, "#C9B8F0").apply { setPadding(0, dp(6), 0, 0) }
+        statusCard.addView(heard)
         content.addView(statusCard)
 
         // Ostatnie dźwięki
@@ -476,6 +479,7 @@ class MainActivity : Activity() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pl-PL")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
         }
@@ -488,7 +492,9 @@ class MainActivity : Activity() {
 
     private val listener = object : RecognitionListener {
         override fun onResults(results: Bundle?) {
-            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            val all = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            all?.firstOrNull()?.let { heard.text = "Usłyszałem: …" + it.takeLast(60) }
+            val text = pickText(all)
             cancelPending()
             if (!text.isNullOrBlank()) handleText(text)
             firedIdx = -1
@@ -503,7 +509,7 @@ class MainActivity : Activity() {
             } else restart(300)
         }
         override fun onPartialResults(partialResults: Bundle?) {
-            val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            val text = pickText(partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION))
             if (!text.isNullOrBlank()) schedulePartial(text)
         }
         override fun onReadyForSpeech(params: Bundle?) {}
@@ -524,7 +530,7 @@ class MainActivity : Activity() {
     // niezmienione przez ~0,6 s, więc nie trzeba czekać na koniec całej wypowiedzi.
     private fun schedulePartial(text: String) {
         val tokens = text.lowercase().split(" ").filter { it.isNotBlank() }
-        val idx = tokens.indexOfLast { norm(it).startsWith(triggerWord) }
+        val idx = tokens.indexOfLast { isTrigger(norm(it)) }
         if (idx < 0 || idx <= firedIdx || idx + 1 >= tokens.size) return
         val words = tokens.drop(idx + 1).take(2)
         val key = "$idx:" + words.joinToString(" ")
@@ -553,9 +559,38 @@ class MainActivity : Activity() {
         Normalizer.normalize(s.lowercase().replace('ł', 'l'), Normalizer.Form.NFD)
             .replace(Regex("\\p{M}+"), "")
 
+    // Odległość edycyjna (ile liter trzeba zmienić, dodać lub usunąć).
+    private fun distance(a: String, b: String): Int {
+        val d = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) d[i][0] = i
+        for (j in 0..b.length) d[0][j] = j
+        for (i in 1..a.length) for (j in 1..b.length) {
+            d[i][j] = minOf(
+                d[i - 1][j] + 1, d[i][j - 1] + 1,
+                d[i - 1][j - 1] + if (a[i - 1] == b[j - 1]) 0 else 1
+            )
+        }
+        return d[a.length][b.length]
+    }
+
+    // Słowo-klucz, także gdy telefon przekręci je o jedną literę (np. "dziwek", "dzwik").
+    private fun isTrigger(n: String): Boolean =
+        n.startsWith(triggerWord) || (n.length in 5..8 && distance(n, triggerWord) <= 1)
+
+    // Rozpoznawanie podaje kilka wersji tego, co usłyszało. Bierzemy pierwszą ze słowem-kluczem.
+    private fun pickText(list: List<String>?): String? =
+        list?.firstOrNull { t -> t.lowercase().split(" ").any { isTrigger(norm(it)) } }
+
+    private val endings = setOf("", "a", "e", "i", "u", "y", "o", "em", "ie", "ow", "om", "ami", "ach", "ia", "iem")
+
+    // Słowo pasuje do hasła ze słownika, jeśli to ono samo albo ono z polską końcówką.
+    // Dzięki temu "laser" nie jest już traktowany jak "las".
+    private fun matchesStem(word: String, stem: String): Boolean =
+        word.startsWith(stem) && word.substring(stem.length) in endings
+
     private fun handleText(text: String) {
         val tokens = text.lowercase().split(" ").filter { it.isNotBlank() }
-        val idx = tokens.indexOfLast { norm(it).startsWith(triggerWord) }
+        val idx = tokens.indexOfLast { isTrigger(norm(it)) }
         if (idx < 0 || idx <= firedIdx || idx + 1 >= tokens.size) return   // brak (nowej) komendy
         firedIdx = idx
         runCommand(tokens.drop(idx + 1).take(2))
@@ -593,7 +628,7 @@ class MainActivity : Activity() {
     private fun translate(words: List<String>): String {
         for (w in words) {
             val n = norm(w)
-            dictionary.firstOrNull { n.startsWith(it.first) }?.let { return it.second }
+            dictionary.firstOrNull { matchesStem(n, it.first) }?.let { return it.second }
         }
         val phrase = words.joinToString(" ")
         try {
