@@ -5,11 +5,17 @@ import android.animation.ObjectAnimator
 import android.animation.PropertyValuesHolder
 import android.animation.ValueAnimator
 import android.app.Activity
+import android.app.AlertDialog
+import android.app.Dialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaPlayer
 import android.os.Bundle
@@ -21,12 +27,15 @@ import android.speech.SpeechRecognizer
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -61,11 +70,20 @@ class MainActivity : Activity() {
     private var player: MediaPlayer? = null
     private lateinit var status: TextView
     private lateinit var keyField: EditText
-    private lateinit var micButton: TextView
+    private lateinit var micButton: FrameLayout
+    private lateinit var micRing: GradientDrawable
+    private lateinit var micIcon: IconView
     private lateinit var micLabel: TextView
     private lateinit var historyText: TextView
     private var pulse: ObjectAnimator? = null
     private val history = mutableListOf<String>()
+    private var lastQuery: String? = null
+    private var firedIdx = -1               // numer słowa-klucza już obsłużonego w tej wypowiedzi
+    private var pendingKey = ""
+    private var partialFire: Runnable? = null
+    private var lastCmd = ""
+    private var lastCmdTime = 0L
+    private var lastLabel: String = ""
     private val prefs by lazy { getSharedPreferences("bajki", Context.MODE_PRIVATE) }
 
     // ---------- Wygląd ----------
@@ -98,12 +116,28 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Color.parseColor("#1B1B3A")
+        cacheDir.listFiles()?.filter { it.name.startsWith("snd_") }?.forEach { it.delete() }
         window.navigationBarColor = Color.parseColor("#3B2667")
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(22), dp(28), dp(22), dp(32))
         }
+
+        // Pasek z menu
+        val menuBtn = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#1AFFFFFF"))
+                setStroke(dp(2), Color.parseColor("#80FFFFFF"))
+            }
+            addView(IconView(context, IconView.MENU), FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+            setOnClickListener { showLibrary() }
+        }
+        content.addView(LinearLayout(this).apply {
+            gravity = Gravity.END
+            addView(menuBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
+        })
 
         // Nagłówek
         content.addView(label("🌙", 44f, "#FFFFFF").apply { gravity = Gravity.CENTER })
@@ -113,13 +147,18 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, 0)
         })
 
-        // Duży przycisk mikrofonu
-        micButton = TextView(this).apply {
-            text = "🎙️"; textSize = 56f; gravity = Gravity.CENTER
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor(gold)) }
-            elevation = dp(10).toFloat()
+        // Duży przycisk mikrofonu (ikona liniowa)
+        micRing = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.parseColor("#1AFFFFFF"))
+            setStroke(dp(3), Color.parseColor(gold))
+        }
+        micIcon = IconView(this, IconView.MIC).apply { color = Color.parseColor(gold) }
+        micButton = FrameLayout(this).apply {
+            background = micRing
+            addView(micIcon, FrameLayout.LayoutParams(dp(64), dp(64), Gravity.CENTER))
             layoutParams = LinearLayout.LayoutParams(dp(150), dp(150)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(28)
+                gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(20)
             }
             setOnClickListener { if (listening) stopListening() else startListening() }
         }
@@ -151,6 +190,7 @@ class MainActivity : Activity() {
         hintCard.addView(label("JAK TO DZIAŁA", 11f, "#C9B8F0", true))
         hintCard.addView(label(
             "Powiedz „dźwięk” i dowolne słowo, np. „dźwięk burzy”, „dźwięk smoka”, „dźwięk samochód”. " +
+                "Możesz podać do dwóch słów, np. „dźwięk latający komar”. Nie podoba ci się dźwięk? Powiedz „dźwięk inny” (inny wariant) albo „dźwięk stop” (cisza). " +
                 "Mów wyraźnie, z krótką pauzą przed i po komendzie. Zwykły tekst bajki jest ignorowany.",
             14f, "#FFFFFF"
         ).apply { setPadding(0, dp(4), 0, 0) })
@@ -213,6 +253,126 @@ class MainActivity : Activity() {
 
     private fun say(msg: String) = main.post { status.text = msg }
 
+    // ---------- Biblioteka dźwięków ----------
+
+    private class Snd(val file: File, val query: String, val idx: Int)
+
+    private fun listSounds(): List<Snd> {
+        val rx = Regex("^snd_(.+)_(\\d+)\\.mp3$")
+        return (filesDir.listFiles() ?: emptyArray()).mapNotNull { f ->
+            val m = rx.find(f.name) ?: return@mapNotNull null
+            Snd(f, m.groupValues[1].replace('_', ' '), m.groupValues[2].toInt())
+        }.sortedWith(compareBy({ it.query }, { it.idx }))
+    }
+
+    private fun deleteSound(snd: Snd) {
+        snd.file.delete()
+        // Usunięty wariant był wybrany? Następnym razem weź kolejny.
+        val k = "pick_${snd.query}"
+        if (prefs.getInt(k, 0) == snd.idx) prefs.edit().putInt(k, snd.idx + 1).apply()
+    }
+
+    private fun pill(text: String, bg: String, fg: String) = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        setTextColor(Color.parseColor(fg))
+        background = rounded(bg, 12)
+        stateListAnimator = null
+    }
+
+    private fun showLibrary() {
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded("#2A1F4D", 24)
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+        }
+        box.addView(label("Moje dźwięki", 20f, "#FFFFFF", true))
+        val summary = label("", 13f, "#C9B8F0").apply { setPadding(0, dp(2), 0, dp(6)) }
+        box.addView(summary)
+
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        box.addView(
+            ScrollView(this).apply { addView(list) },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        )
+
+        fun refresh() {
+            list.removeAllViews()
+            val sounds = listSounds()
+            val total = sounds.sumOf { it.file.length() }
+            summary.text = if (sounds.isEmpty()) "Brak zapisanych dźwięków"
+            else "${sounds.size} plików · ${"%.1f".format(total / 1048576.0)} MB w pamięci telefonu"
+            if (sounds.isEmpty()) {
+                list.addView(label("Powiedz np. „dźwięk burza” — dźwięk zapisze się tutaj.", 14f, "#FFFFFF")
+                    .apply { setPadding(0, dp(12), 0, 0) })
+            }
+            for (snd in sounds) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = rounded("#1AFFFFFF", 14)
+                    setPadding(dp(14), dp(8), dp(6), dp(8))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { topMargin = dp(8) }
+                    setOnClickListener { play(snd.file) }
+                }
+                val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                texts.addView(label(snd.query, 16f, "#FFFFFF", true))
+                texts.addView(label("wariant ${snd.idx + 1} · ${snd.file.length() / 1024} KB", 12f, "#C9B8F0"))
+                row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                row.addView(label("▶", 18f, gold).apply {
+                    setPadding(dp(14), dp(10), dp(14), dp(10))
+                    setOnClickListener { play(snd.file) }
+                })
+                row.addView(label("✕", 18f, "#FF8A8A").apply {
+                    setPadding(dp(14), dp(10), dp(14), dp(10))
+                    setOnClickListener {
+                        AlertDialog.Builder(this@MainActivity)
+                            .setMessage("Usunąć „${snd.query}” (wariant ${snd.idx + 1})?")
+                            .setPositiveButton("Usuń") { _, _ -> deleteSound(snd); refresh() }
+                            .setNegativeButton("Anuluj", null)
+                            .show()
+                    }
+                })
+                list.addView(row)
+            }
+        }
+        refresh()
+
+        val buttons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(12), 0, 0)
+        }
+        buttons.addView(pill("Wyczyść wszystko", "#33FF8A8A", "#FFB3B3").apply {
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage("Usunąć wszystkie zapisane dźwięki?")
+                    .setPositiveButton("Usuń") { _, _ ->
+                        listSounds().forEach { it.file.delete() }
+                        val e = prefs.edit()
+                        prefs.all.keys.filter { it.startsWith("pick_") }.forEach { e.remove(it) }
+                        e.apply()
+                        refresh()
+                    }
+                    .setNegativeButton("Anuluj", null)
+                    .show()
+            }
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(8) })
+        buttons.addView(pill("Zamknij", gold, "#1B1B3A").apply {
+            setOnClickListener { dialog.dismiss() }
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        box.addView(buttons)
+
+        dialog.setContentView(box)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.show()
+        val dm = resources.displayMetrics
+        dialog.window?.setLayout((dm.widthPixels * 0.92).toInt(), (dm.heightPixels * 0.75).toInt())
+    }
+
     private fun addHistory(line: String) {
         history.add(0, line)
         while (history.size > 5) history.removeAt(history.size - 1)
@@ -220,7 +380,9 @@ class MainActivity : Activity() {
     }
 
     private fun setListeningUi(on: Boolean) {
-        (micButton.background as GradientDrawable).setColor(Color.parseColor(if (on) teal else gold))
+        val c = Color.parseColor(if (on) teal else gold)
+        micRing.setStroke(dp(3), c)
+        micIcon.color = c
         micLabel.text = if (on) "Słucham… powiedz „dźwięk burzy”" else "Dotknij, aby zacząć słuchać"
         pulse?.cancel()
         micButton.scaleX = 1f; micButton.scaleY = 1f
@@ -273,8 +435,9 @@ class MainActivity : Activity() {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pl-PL")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
         }
         recognizer?.startListening(intent)
     }
@@ -286,22 +449,56 @@ class MainActivity : Activity() {
     private val listener = object : RecognitionListener {
         override fun onResults(results: Bundle?) {
             val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            cancelPending()
             if (!text.isNullOrBlank()) handleText(text)
-            restart(200)
+            firedIdx = -1
+            restart(100)
         }
         override fun onError(error: Int) {
+            cancelPending()
+            firedIdx = -1
             // Cisza / brak dopasowania to normalne zdarzenia, po prostu słuchamy dalej.
             if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
                 recognizer?.cancel(); restart(1000)
-            } else restart(400)
+            } else restart(300)
+        }
+        override fun onPartialResults(partialResults: Bundle?) {
+            val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            if (!text.isNullOrBlank()) schedulePartial(text)
         }
         override fun onReadyForSpeech(params: Bundle?) {}
         override fun onBeginningOfSpeech() {}
         override fun onRmsChanged(rmsdB: Float) {}
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {}
-        override fun onPartialResults(partialResults: Bundle?) {}
         override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
+    private fun cancelPending() {
+        partialFire?.let { main.removeCallbacks(it) }
+        partialFire = null
+        pendingKey = ""
+    }
+
+    // Komenda z wyników częściowych: odpala się, gdy słowa po "dźwięk" (maks. 2) są
+    // niezmienione przez ~0,6 s, więc nie trzeba czekać na koniec całej wypowiedzi.
+    private fun schedulePartial(text: String) {
+        val tokens = text.lowercase().split(" ").filter { it.isNotBlank() }
+        val idx = tokens.indexOfLast { norm(it).startsWith(triggerWord) }
+        if (idx < 0 || idx <= firedIdx || idx + 1 >= tokens.size) return
+        val words = tokens.drop(idx + 1).take(2)
+        val key = "$idx:" + words.joinToString(" ")
+        if (key == pendingKey) return
+        cancelPending()
+        pendingKey = key
+        val r = Runnable {
+            partialFire = null
+            pendingKey = ""
+            firedIdx = idx
+            runCommand(words)
+        }
+        partialFire = r
+        main.postDelayed(r, 600)
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
@@ -319,11 +516,37 @@ class MainActivity : Activity() {
     private fun handleText(text: String) {
         val tokens = text.lowercase().split(" ").filter { it.isNotBlank() }
         val idx = tokens.indexOfLast { norm(it).startsWith(triggerWord) }
-        if (idx < 0) return                       // brak słowa-klucza -> ignorujemy
-        val words = tokens.drop(idx + 1).take(2)
-        if (words.isEmpty()) return
-        say("Komenda: \"${words.joinToString(" ")}\" -> szukam...")
-        fetchAndPlay(words)
+        if (idx < 0 || idx <= firedIdx || idx + 1 >= tokens.size) return   // brak (nowej) komendy
+        firedIdx = idx
+        runCommand(tokens.drop(idx + 1).take(2))
+    }
+
+    private fun runCommand(words: List<String>) {
+        val phrase = words.joinToString(" ")
+        val n = norm(words.first())
+        val now = System.currentTimeMillis()
+        if (norm(phrase) == lastCmd && now - lastCmdTime < 2000) return   // ta sama komenda z wyniku częściowego i końcowego
+        lastCmd = norm(phrase)
+        lastCmdTime = now
+        when {
+            listOf("stop", "cisz", "przestan", "koniec").any { n.startsWith(it) } -> {
+                stopSound()
+                say("Dźwięk zatrzymany.")
+            }
+            listOf("inn", "nastepn", "kolejn", "dalej").any { n.startsWith(it) } -> {
+                say("Szukam innego dźwięku...")
+                fetchAndPlay(words, true)
+            }
+            else -> {
+                say("Komenda: \"$phrase\" -> szukam...")
+                fetchAndPlay(words, false)
+            }
+        }
+    }
+
+    private fun stopSound() {
+        player?.release()
+        player = null
     }
 
     // Słownik (szybko, offline), a dla innych słów darmowe tłumaczenie PL -> EN.
@@ -343,27 +566,68 @@ class MainActivity : Activity() {
         return norm(phrase)
     }
 
-    private fun fetchAndPlay(words: List<String>) {
+    private fun soundFile(query: String, idx: Int) =
+        File(filesDir, "snd_" + query.replace(Regex("[^a-z0-9]+"), "_") + "_" + idx + ".mp3")
+
+    private fun search(query: String, key: String): JSONArray {
+        val filter = URLEncoder.encode("duration:[1 TO 10]", "UTF-8")
+        val url = "https://freesound.org/apiv2/search/text/" +
+            "?query=" + URLEncoder.encode(query, "UTF-8") +
+            "&filter=" + filter +
+            "&sort=rating_desc&fields=id,name,previews,duration&page_size=15" +
+            "&token=" + key
+        return JSONObject(httpGet(url)).getJSONArray("results")
+    }
+
+    // other = true: ten sam dźwięk co ostatnio, ale kolejny wynik z bazy ("dźwięk inny").
+    private fun fetchAndPlay(words: List<String>, other: Boolean) {
         val key = prefs.getString("key", "").orEmpty().trim()
         if (key.isEmpty()) { say("Najpierw wpisz i zapisz klucz API."); return }
         thread {
             try {
-                val query = translate(words)
-                say("Szukam: $query")
-                val file = File(cacheDir, "snd_" + query.replace(Regex("[^a-z0-9]+"), "_") + ".mp3")
-                if (!file.exists()) {
-                    val filter = URLEncoder.encode("duration:[1 TO 10]", "UTF-8")
-                    val url = "https://freesound.org/apiv2/search/text/" +
-                        "?query=" + URLEncoder.encode(query, "UTF-8") +
-                        "&filter=" + filter +
-                        "&sort=rating_desc&fields=id,name,previews,duration&page_size=5" +
-                        "&token=" + key
-                    val results = JSONObject(httpGet(url)).getJSONArray("results")
-                    if (results.length() == 0) { say("Nie znaleziono dźwięku: ${words.joinToString(" ")} (szukano: $query)"); return@thread }
-                    val mp3 = results.getJSONObject(0).getJSONObject("previews").getString("preview-hq-mp3")
-                    download(mp3, file)
+                var query = (if (other) lastQuery else translate(words))
+                if (query == null) {
+                    say("Najpierw poproś o jakiś dźwięk, np. „dźwięk komar”.")
+                    return@thread
                 }
-                main.post { play(file); addHistory("🔊 ${words.joinToString(" ")}  →  $query") }
+                val label = if (other) lastLabel else words.joinToString(" ")
+                val step = if (other) 1 else 0
+                var idx = prefs.getInt("pick_$query", 0) + step
+                say("Szukam: $query" + if (idx > 0) " (wariant ${idx + 1})" else "")
+
+                var file = soundFile(query, idx)
+                if (!file.exists()) {
+                    var results = search(query, key)
+                    if (results.length() == 0 && query.contains(" ")) {
+                        // Brak wyników dla całej frazy -> spróbuj samego ostatniego słowa (zwykle rzeczownik).
+                        query = query.substringAfterLast(" ")
+                        idx = prefs.getInt("pick_$query", 0) + step
+                        file = soundFile(query, idx)
+                        say("Szukam: $query")
+                        if (!file.exists()) results = search(query, key)
+                    }
+                    if (!file.exists()) {
+                        if (results.length() == 0) {
+                            say("Nie znaleziono dźwięku: $label (szukano: $query)")
+                            return@thread
+                        }
+                        if (idx >= results.length()) {      // skończyły się warianty -> od początku
+                            idx = 0
+                            file = soundFile(query, 0)
+                        }
+                        if (!file.exists()) {
+                            val mp3 = results.getJSONObject(idx).getJSONObject("previews").getString("preview-hq-mp3")
+                            download(mp3, file)
+                        }
+                    }
+                }
+                prefs.edit().putInt("pick_$query", idx).apply()   // zapamiętaj wybrany wariant
+                lastQuery = query
+                lastLabel = label
+                val f = file
+                val n = idx + 1
+                val q = query
+                main.post { play(f); addHistory("🔊 $label  →  $q (#$n)") }
             } catch (e: Exception) {
                 say("Błąd: ${e.message}")
             }
@@ -399,5 +663,42 @@ class MainActivity : Activity() {
         recognizer?.destroy()
         player?.release()
         super.onDestroy()
+    }
+}
+
+
+/** Ikony rysowane linią (bez plików graficznych): mikrofon i menu. */
+class IconView(context: Context, private val kind: Int) : View(context) {
+    companion object {
+        const val MIC = 0
+        const val MENU = 1
+    }
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
+    var color: Int = Color.WHITE
+        set(value) { field = value; invalidate() }
+
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        paint.color = color
+        if (kind == MIC) {
+            paint.strokeWidth = w * 0.07f
+            val bodyW = w * 0.32f
+            c.drawRoundRect(RectF(w / 2 - bodyW / 2, h * 0.08f, w / 2 + bodyW / 2, h * 0.58f), bodyW / 2, bodyW / 2, paint)
+            c.drawArc(RectF(w * 0.22f, h * 0.30f, w * 0.78f, h * 0.76f), 0f, 180f, false, paint)
+            c.drawLine(w / 2, h * 0.76f, w / 2, h * 0.92f, paint)
+            c.drawLine(w * 0.34f, h * 0.92f, w * 0.66f, h * 0.92f, paint)
+        } else {
+            paint.strokeWidth = h * 0.09f
+            c.drawLine(w * 0.12f, h * 0.25f, w * 0.88f, h * 0.25f, paint)
+            c.drawLine(w * 0.12f, h * 0.50f, w * 0.88f, h * 0.50f, paint)
+            c.drawLine(w * 0.12f, h * 0.75f, w * 0.60f, h * 0.75f, paint)
+        }
     }
 }
